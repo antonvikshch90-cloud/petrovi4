@@ -72,7 +72,7 @@ def reply_with_soul(user_id: str, user_text: str) -> str:
     messages = [{"role": "system", "content": SOUL}] + history
 
     response = client.chat.completions.create(
-        model="gemini-3.8-flash",
+        model="gemini-2.5-flash-lite",
         max_tokens=1024,
         temperature=0.7,
         messages=messages,
