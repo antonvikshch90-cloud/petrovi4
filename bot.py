@@ -9,11 +9,10 @@ Builds on 02 by adding:
 
 Usage:
     uv run python 03-personality-soul/bot.py            # CLI mode
-    uv run python 03-personality-soul/bot.py --telegram # Telegram mode
+    uv run python 03-personality-soul/bot.py --telegram # Telegram mode (webhook)
 """
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,10 +24,18 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 load_dotenv(override=True)
 
+# --- Логирование ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-coder")
 client = OpenAI(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     api_key=os.environ["GEMINI_API_KEY"],
+    max_retries=5,
 )
 
 BOT_DIR = Path(__file__).parent
@@ -63,14 +70,13 @@ def append_message(user_id: str, message: dict):
 # --- Core: stateful one-shot with personality ---
 
 def reply_with_soul(user_id: str, user_text: str) -> str:
-    """Call the LLM with SOUL as system prompt + persisted history."""
+    """Call the LLM with SOUL as system prompt + persisted history (CLI only)."""
     history = load_session(user_id)
 
     user_msg = {"role": "user", "content": user_text}
     history.append(user_msg)
     append_message(user_id, user_msg)
 
-    # Prepend the system prompt — the soul lives outside the saved history
     messages = [{"role": "system", "content": SOUL}] + history
 
     response = client.chat.completions.create(
@@ -90,16 +96,27 @@ def reply_with_soul(user_id: str, user_text: str) -> str:
 # --- Telegram channel ---
 
 async def start_command(update, context):
-    await update.message.reply_text("Привет! Меня зовут Петрович, мне 40 лет и я алкоголик из Владивостока. Сегодня я трезв уже 10 лет и готов помочь тебе бросить пить. Задавай любые вопросы по этой теме, поделюсь опытом и что-нибудь придумаем с твоей ситуацией ;)")
+    await update.message.reply_text(
+        "Привет! Меня зовут Петрович, мне 40 лет и я алкоголик из Владивостока. "
+        "Сегодня я трезв уже 10 лет и готов помочь тебе бросить пить. "
+        "Задавай любые вопросы по этой теме, поделюсь опытом и что-нибудь придумаем с твоей ситуацией ;)"
+    )
+
+
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    session_file = SESSIONS_DIR / f"{user_id}.jsonl"
+    if session_file.exists():
+        session_file.unlink()
+    await update.message.reply_text("Начинаем с чистого листа. О чём поговорим?")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text
 
-    # Отправляем пустое сообщение-заглушку, которое будем обновлять
     bot_msg = await update.message.reply_text("⏳")
 
-    # Загружаем историю и добавляем сообщение пользователя
     history = load_session(user_id)
     user_msg = {"role": "user", "content": user_text}
     history.append(user_msg)
@@ -107,61 +124,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messages = [{"role": "system", "content": SOUL}] + history
 
-    # Включаем стриминг
-    stream = client.chat.completions.create(
-        model="gemini-3.5-flash-lite",
-        max_tokens=1024,
-        temperature=0.7,
-        messages=messages,
-        stream=True,  # <-- ЭТО ГЛАВНОЕ
-    )
+    try:
+        stream = client.chat.completions.create(
+            model="gemini-3.5-flash-lite",
+            max_tokens=1024,
+            temperature=0.7,
+            messages=messages,
+            stream=True,
+        )
 
-    full_text = ""
-    chunk_count = 0
+        full_text = ""
+        chunk_count = 0
 
-    for chunk in stream:
-        if chunk.choices[0].delta.content:
-            full_text += chunk.choices[0].delta.content
-            chunk_count += 1
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                full_text += chunk.choices[0].delta.content
+                chunk_count += 1
 
-            # Обновляем сообщение каждые 15 чанков (~0.5-1 сек)
-            if chunk_count % 15 == 0:
-                try:
-                    await bot_msg.edit_text(full_text + " ▌")
-                except Exception:
-                    pass  # Игнорируем rate limit Telegram
+                if chunk_count % 15 == 0:
+                    try:
+                        await bot_msg.edit_text(full_text + " ▌")
+                    except Exception:
+                        pass
 
-    # Финальное обновление — убираем курсор
-    await bot_msg.edit_text(full_text)
+        await bot_msg.edit_text(full_text)
 
-    # Сохраняем ответ в историю
-    assistant_msg = {"role": "assistant", "content": full_text}
-    append_message(user_id, assistant_msg)
+        assistant_msg = {"role": "assistant", "content": full_text}
+        append_message(user_id, assistant_msg)
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'Bot is running')
+    except Exception as e:
+        logger.error(f"Ошибка модели: {e}")
+        try:
+            await bot_msg.edit_text("Сейчас я немного перегружен. Попробуй написать ещё раз через минуту.")
+        except Exception:
+            pass
 
-    def log_message(self, format, *args):
-        pass  # Отключаем логи, чтобы не засорять вывод
 
-def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    print(f"Health server started on port {port}")
-    server.serve_forever()
+async def error_handler(update, context):
+    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Что-то пошло не так. Попробуй ещё раз."
+            )
+        except Exception:
+            pass
+
 
 def run_telegram():
-    threading.Thread(target=start_health_server, daemon=True).start()    
     token = os.environ["TELEGRAM_BOT_TOKEN"]
+    port = int(os.environ.get("PORT", 10000))
+
+    # Render автоматически создаёт эту переменную
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not hostname:
+        logger.error("RENDER_EXTERNAL_HOSTNAME не задан. Webhook не сможет работать.")
+        sys.exit(1)
+
+    webhook_url = f"https://{hostname}/webhook"
+
     app = ApplicationBuilder().token(token).build()
+
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("new", new_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print(f"Telegram bot running with SOUL — sessions in {SESSIONS_DIR}")
-    app.run_polling()
+    app.add_error_handler(error_handler)
+
+    logger.info(f"Запуск webhook на порту {port}, URL: {webhook_url}")
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path="webhook",
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+    )
 
 
 # --- CLI channel ---
